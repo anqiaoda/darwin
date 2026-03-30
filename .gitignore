@@ -32,6 +32,9 @@ env/
 *.swo
 *~
 
+# Data
+data/*
+
 # Logs
 logs/
 *.log
