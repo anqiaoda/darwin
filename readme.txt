@@ -1,0 +1,2 @@
+打包exe命令
+pyinstaller darwin.spec

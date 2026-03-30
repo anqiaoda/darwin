@@ -1,0 +1,46 @@
+{
+  "camera": {
+    "device_id": 1,
+    "width": 640,
+    "height": 480,
+    "fps": 30,
+    "buffer_size": 1,
+    "backend": "dshow"
+  },
+  "video": {
+    "codec": "mp4v",
+    "output_width": null,
+    "output_height": null
+  },
+  "display": {
+    "window_name_original": "Darwin Original",
+    "window_name_processed": "Darwin Processed",
+    "show_fps": true,
+    "scale_factor": 1.0,
+    "show_original": true,
+    "show_processed": false,
+    "http": {
+      "base_url": "http://172.18.20.118:9000",
+      "endpoint": "/process/image_yolo",
+      "timeout": 10,
+      "max_retries": 3
+    }
+  },
+  "mujoco": {
+    "robot": "g1",
+    "scene_file": null,
+    "simulate_dt": 0.005,
+    "viewer_dt": 0.02,
+    "control_dt": 0.02,
+    "prepare_steps": 60,
+    "gravity": [0, 0, 0],
+    "show_mujoco": true,
+    "http": {
+      "base_url": "http://127.0.0.1:9000",
+      "endpoint": "/process/image",
+      "timeout": 10
+    }
+  },
+  "log_level": "INFO",
+  "temp_dir": "./data/temp"
+}
