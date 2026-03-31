@@ -27,6 +27,8 @@ class HTTPConfig:
     endpoint: str = "/process/image"              # API端点
     timeout: int = 10                             # 请求超时时间(秒)
     max_retries: int = 3                          # 最大重试次数
+    use_websocket: bool = False                   # 是否使用WebSocket
+    websocket_endpoint: str = "/ws/infer"         # WebSocket端点（可选）
 
 
 @dataclass
@@ -118,6 +120,25 @@ def load_config_from_file(config_path: Optional[Path] = None) -> dict:
         return {}
 
 
+def get_http_config(http_data: dict) -> HTTPConfig:
+    """从JSON数据创建HTTP配置对象
+
+    Args:
+        http_data: HTTP配置字典
+
+    Returns:
+        HTTPConfig实例
+    """
+    return HTTPConfig(
+        base_url=http_data.get("base_url", "http://172.18.20.118:9000"),
+        endpoint=http_data.get("endpoint", "/process/image"),
+        timeout=http_data.get("timeout", 10),
+        max_retries=http_data.get("max_retries", 3),
+        use_websocket=http_data.get("use_websocket", False),
+        websocket_endpoint=http_data.get("websocket_endpoint", "/ws/infer")
+    )
+
+
 def get_config(config_file: Optional[str] = None) -> Config:
     """
     获取配置实例
@@ -136,7 +157,7 @@ def get_config(config_file: Optional[str] = None) -> Config:
     video = VideoConfig(**config_data.get("video", {}))
 
     display_data = config_data.get("display", {})
-    display_http = display_data.get("http", {})
+    display_http = get_http_config(display_data.get("http", {}))
     display = DisplayConfig(
         window_name_original=display_data.get("window_name_original", "Darwin Original"),
         window_name_processed=display_data.get("window_name_processed", "Darwin Processed"),
@@ -144,11 +165,11 @@ def get_config(config_file: Optional[str] = None) -> Config:
         scale_factor=display_data.get("scale_factor", 1.0),
         show_original=display_data.get("show_original", True),
         show_processed=display_data.get("show_processed", True),
-        http=HTTPConfig(**display_http)
+        http=display_http
     )
 
     mujoco_data = config_data.get("mujoco", {})
-    mujoco_http = mujoco_data.get("http", {})
+    mujoco_http = get_http_config(mujoco_data.get("http", {}))
     gravity = mujoco_data.get("gravity", [0, 0, 0])
 
     mujoco = MuJoCoConfig(
@@ -160,7 +181,7 @@ def get_config(config_file: Optional[str] = None) -> Config:
         prepare_steps=mujoco_data.get("prepare_steps", 60),
         gravity=gravity,
         show_mujoco=mujoco_data.get("show_mujoco", False),
-        http=HTTPConfig(**mujoco_http)
+        http=mujoco_http
     )
 
     log_level = config_data.get("log_level", "INFO")

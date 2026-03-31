@@ -15,7 +15,7 @@
   "display": {
     "window_name_original": "Darwin Original",
     "window_name_processed": "Darwin Processed",
-    "show_fps": false,
+    "show_fps": true,
     "scale_factor": 1.0,
     "show_original": true,
     "show_processed": false,
@@ -36,9 +36,10 @@
     "gravity": [0, 0, 0],
     "show_mujoco": true,
     "http": {
-      "base_url": "http://172.18.20.118:9001",
-      "endpoint": "/process/frame",
-      "timeout": 10
+      "base_url": "http://172.18.26.235:8001",
+      "endpoint": "/ws/infer",
+      "timeout": 10,
+      "use_websocket": true
     }
   },
   "log_level": "INFO",

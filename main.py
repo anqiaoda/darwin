@@ -3,7 +3,6 @@ Darwin 统一主程序
 集成 main_root_realtime.py 和 main_openmmlab.py 的功能
 通过配置文件控制显示哪些窗口
 """
-import cv2
 import sys
 import time
 import numpy as np
@@ -17,6 +16,7 @@ from config import get_config, Config
 from core.camera_capture import CameraCapture
 from core.video_decoder import VideoDecoder
 from core.action_http_client import ActionHTTPClient
+from core.action_websocket_client import ActionWebSocketClient
 from core.http_client import HTTPClient
 from core.mujoco_simulator import MuJoCoRobotSimulator
 from core.display import Display
@@ -40,13 +40,19 @@ class DarwinIntegratedApp:
         # 初始化显示模块
         self.display = Display(config.display)
 
-        # 根据配置初始化HTTP客户端
-        # 可以同时使用两个HTTP客户端
+        # 根据配置初始化HTTP客户端或WebSocket客户端
+        # 可以同时使用两个客户端
         self.action_client = None
         self.openmm_client = None
 
         if config.mujoco.show_mujoco:
-            self.action_client = ActionHTTPClient(config.mujoco.http)
+            # 根据配置选择 HTTP 或 WebSocket
+            if config.mujoco.http.use_websocket:
+                self._logger.info("使用WebSocket模式连接动作服务")
+                self.action_client = ActionWebSocketClient(config.mujoco.http)
+            else:
+                self._logger.info("使用HTTP模式连接动作服务")
+                self.action_client = ActionHTTPClient(config.mujoco.http)
 
         if config.display.show_processed:
             self.openmm_client = HTTPClient(config.display.http)
@@ -78,6 +84,7 @@ class DarwinIntegratedApp:
         self._last_action_time = 0
         self._action_count = 0
         self._frame_count = 0
+        self._last_frame_update = 0  # 用于限流显示更新
 
     def _init_mujoco(self) -> bool:
         """初始化MuJoCo仿真器"""
@@ -143,10 +150,16 @@ class DarwinIntegratedApp:
 
                 # 机器人控制模式（优先处理）
                 if self.config.mujoco.show_mujoco and self.action_client:
-                    # 使用新接口 /process/frame，直接发送帧数据无需图片转换
+                    # 获取动作数据
                     action_data = self.action_client.send_frame(encoded_frame)
-                    if action_data and 'q' in action_data:
-                        self._apply_robot_action(action_data['q'])
+                    if action_data:
+                        # 新格式：motions.dof_pos (29个关节)
+                        if 'motions' in action_data and 'dof_pos' in action_data['motions']:
+                            dof_pos = action_data['motions']['dof_pos']
+                            self._apply_robot_action(dof_pos)
+                        # 兼容旧格式：q
+                        elif 'q' in action_data:
+                            self._apply_robot_action(action_data['q'])
 
                 # 图像处理模式（可同时进行）
                 if self.config.display.show_processed and self.openmm_client:
@@ -159,7 +172,7 @@ class DarwinIntegratedApp:
                     )
                     processed_frame = self.decoder.decode_result(result)
 
-                # 4. 根据配置显示窗口
+                # 4. 根据配置显示窗口（非阻塞，放入队列）
                 if self.config.display.show_original:
                     self.display.show_original(frame)
 
@@ -170,36 +183,14 @@ class DarwinIntegratedApp:
                         # 如果机器人模式开启但没有processed frame，显示原始帧
                         self.display.show_processed(frame)
 
-                # 5. 检查退出按键
-                key = self.display.wait_key(1)
-
-                # 根据配置的窗口检查退出条件
-                should_exit = False
-                if key == 27:  # ESC键
-                    should_exit = True
-
-                # 检查原始窗口
-                if self.config.display.show_original:
-                    window_closed = (
-                        cv2.getWindowProperty(self.config.display.window_name_original, cv2.WND_PROP_VISIBLE) < 1
-                    )
-                    if window_closed:
-                        should_exit = True
-
-                # 检查处理窗口
-                if self.config.display.show_processed:
-                    window_closed = (
-                        cv2.getWindowProperty(self.config.display.window_name_processed, cv2.WND_PROP_VISIBLE) < 1
-                    )
-                    if window_closed:
-                        should_exit = True
+                # 5. 检查退出信号（由显示线程处理）
+                if self.display.check_exit():
+                    self._logger.info("用户退出程序")
+                    break
 
                 # 检查MuJoCo窗口
                 if self.simulator and not self.simulator.is_running():
-                    should_exit = True
-
-                if should_exit:
-                    self._logger.info("用户退出程序")
+                    self._logger.info("MuJoCo窗口已关闭")
                     break
 
         except KeyboardInterrupt:
