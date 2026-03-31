@@ -41,12 +41,15 @@ class HTTPClient:
         else:
             self._consecutive_429 = 0
 
-    def send_frame(self, frame_data: bytes) -> Optional[bytes]:
+    def send_frame(self, frame_data: bytes, height: int = 480, width: int = 640, channels: int = 3) -> Optional[bytes]:
         """
         发送帧数据到模型服务进行骨骼检测
 
         Args:
-            frame_data: 编码后的图片字节数据 (JPEG/PNG等)
+            frame_data: 原始图像字节数据（numpy uint8 数组的字节流）
+            height: 图像高度
+            width: 图像宽度
+            channels: 图像通道数
 
         Returns:
             模型返回的处理后图片数据 (带骨骼绘制)
@@ -59,11 +62,17 @@ class HTTPClient:
 
         for attempt in range(self.config.max_retries):
             try:
-                # 使用files参数，字段名为'file'（根据API文档要求）
-                files = {"file": ("frame.jpg", frame_data, "image/jpeg")}
+                # 构造数据：前12字节为尺寸信息，后面是图像数据
+                header = height.to_bytes(4, byteorder='little') + \
+                         width.to_bytes(4, byteorder='little') + \
+                         channels.to_bytes(4, byteorder='little')
+                payload = header + frame_data
+
+                # 使用原始二进制格式发送
                 response = self._session.post(
                     url,
-                    files=files,
+                    data=payload,
+                    headers={"Content-Type": "application/octet-stream"},
                     timeout=self.config.timeout
                 )
 

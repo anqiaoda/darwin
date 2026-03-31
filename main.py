@@ -143,13 +143,20 @@ class DarwinIntegratedApp:
 
                 # 机器人控制模式（优先处理）
                 if self.config.mujoco.show_mujoco and self.action_client:
-                    action_data = self.action_client.send_image(encoded_frame)
+                    # 使用新接口 /process/frame，直接发送帧数据无需图片转换
+                    action_data = self.action_client.send_frame(encoded_frame)
                     if action_data and 'q' in action_data:
                         self._apply_robot_action(action_data['q'])
 
                 # 图像处理模式（可同时进行）
                 if self.config.display.show_processed and self.openmm_client:
-                    result = self.openmm_client.send_frame(encoded_frame)
+                    # /process/frame_yolo 接口需要原始 numpy 字节流，不是 JPEG 编码
+                    result = self.openmm_client.send_frame(
+                        frame.tobytes(),
+                        height=frame.shape[0],
+                        width=frame.shape[1],
+                        channels=frame.shape[2] if len(frame.shape) == 3 else 1
+                    )
                     processed_frame = self.decoder.decode_result(result)
 
                 # 4. 根据配置显示窗口
