@@ -1,9 +1,11 @@
 """
 深度相机视频流采集模块
 实时从深度相机获取视频流数据
+使用后台线程持续读帧，避免主循环被阻塞
 """
 import cv2
 import time
+import threading
 from typing import Optional, Tuple
 from threading import Lock
 
@@ -12,7 +14,7 @@ from utils.logger import get_logger
 
 
 class CameraCapture:
-    """相机采集器"""
+    """相机采集器 - 后台线程持续读帧"""
 
     def __init__(self, config: CameraConfig):
         self.config = config
@@ -21,6 +23,13 @@ class CameraCapture:
         self._logger = get_logger(__name__)
         self._last_frame_time = 0
         self._frame_count = 0
+
+        # 后台读帧线程相关
+        self._read_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._latest_frame: Optional[Tuple[bool, any]] = None
+        self._frame_lock = Lock()
+        self._new_frame_event = threading.Event()
 
     def open(self) -> bool:
         """打开相机设备"""
@@ -58,22 +67,65 @@ class CameraCapture:
             self._logger.info(
                 f"相机已打开: {self.config.width}x{self.config.height} @{self.config.fps}fps"
             )
+
+            # 启动后台读帧线程
+            self._stop_event.clear()
+            self._read_thread = threading.Thread(target=self._read_loop, daemon=True)
+            self._read_thread.start()
+            self._logger.info("后台读帧线程已启动")
+
             return True
 
         finally:
             self._lock.release()
 
-    def read(self) -> Optional[Tuple[bool, any]]:
-        """读取一帧图像"""
-        if self.cap is None:
-            self._logger.error("相机未打开")
-            return None
+    def _read_loop(self):
+        """后台线程持续读帧，保持最新帧可用"""
+        self._logger.info("读帧线程进入循环")
+        while not self._stop_event.is_set():
+            if self.cap is None or not self.cap.isOpened():
+                time.sleep(0.01)
+                continue
 
-        ret, frame = self.cap.read()
-        return ret, frame
+            ret, frame = self.cap.read()
+            if ret and frame is not None:
+                with self._frame_lock:
+                    self._latest_frame = (ret, frame)
+                self._new_frame_event.set()
+            else:
+                time.sleep(0.001)
+
+        self._logger.info("读帧线程结束")
+
+    def read(self) -> Optional[Tuple[bool, any]]:
+        """读取最新一帧图像（非阻塞，返回后台线程最新采集的帧）
+
+        Returns:
+            (ret, frame) 元组，如果没有可用帧返回 None
+        """
+        with self._frame_lock:
+            return self._latest_frame
+
+    def read_wait(self, timeout: float = 0.1) -> Optional[Tuple[bool, any]]:
+        """等待并读取最新一帧图像
+
+        Args:
+            timeout: 等待超时时间（秒）
+
+        Returns:
+            (ret, frame) 元组，如果超时返回 None
+        """
+        self._new_frame_event.clear()
+        self._new_frame_event.wait(timeout=timeout)
+        with self._frame_lock:
+            return self._latest_frame
 
     def release(self):
         """释放相机资源"""
+        self._stop_event.set()
+        if self._read_thread:
+            self._read_thread.join(timeout=2.0)
+
         self._lock.acquire()
         try:
             if self.cap is not None:

@@ -5,6 +5,7 @@ Darwin 统一主程序
 """
 import sys
 import time
+import threading
 import numpy as np
 from pathlib import Path
 from typing import Optional
@@ -108,6 +109,10 @@ class DarwinIntegratedApp:
         self._frame_count = 0
         self._last_frame_update = 0  # 用于限流显示更新
 
+        # 视频显示独立推送线程：将相机帧持续推送到显示窗口，不依赖主控制循环
+        self._display_push_thread = None
+        self._display_push_stop = threading.Event()
+
     def _init_mujoco(self) -> bool:
         """初始化MuJoCo仿真器"""
         try:
@@ -122,6 +127,33 @@ class DarwinIntegratedApp:
         except Exception as e:
             self._logger.error(f"初始化仿真器失败: {e}", exc_info=True)
             return False
+
+    def _display_push_loop(self):
+        """独立线程：持续将相机最新帧推送到显示窗口
+        这个线程与主控制循环完全解耦，即使主循环因网络请求阻塞，
+        视频窗口仍能保持高帧率。
+        """
+        self._logger.info("视频显示推送线程启动")
+        while not self._display_push_stop.is_set():
+            # 从相机获取最新帧（非阻塞）
+            data = self.camera.read()
+            if data is None:
+                time.sleep(0.001)
+                continue
+
+            ret, frame = data
+            if not ret or frame is None:
+                time.sleep(0.001)
+                continue
+
+            # 推送到原始窗口显示
+            if self.config.display.show_original:
+                self.display.show_original(frame)
+
+            # 控制推送频率，不超过显示刷新率
+            time.sleep(0.005)  # ~200fps上限，足够流畅
+
+        self._logger.info("视频显示推送线程结束")
 
     def run(self):
         """运行主循环"""
@@ -140,6 +172,29 @@ class DarwinIntegratedApp:
             self._current_positions = self.simulator.get_joint_positions()
             self._prepare_robot()
 
+        # 启动独立的视频显示推送线程
+        if self.config.display.show_original:
+            self._display_push_stop.clear()
+            self._display_push_thread = threading.Thread(
+                target=self._display_push_loop, daemon=True
+            )
+            self._display_push_thread.start()
+
+        # 等待相机后台读帧线程就绪（第一帧可用）
+        self._logger.info("等待相机第一帧...")
+        for i in range(100):  # 最多等1秒
+            data = self.camera.read()
+            if data is not None:
+                ret, frame = data
+                if ret and frame is not None:
+                    self._logger.info(f"相机第一帧就绪 ({i*10}ms), 分辨率: {frame.shape}")
+                    break
+            time.sleep(0.01)
+        else:
+            self._logger.error("等待相机第一帧超时，程序退出")
+            self._cleanup()
+            return
+
         self._logger.info("开始实时控制循环...")
         print("\n" + "="*50)
         print("实时控制已启动")
@@ -149,16 +204,17 @@ class DarwinIntegratedApp:
             while True:
                 self._frame_count += 1
 
-                # 1. 从相机读取帧
+                # 1. 从相机读取帧（非阻塞，获取最新帧）
                 data = self.camera.read()
                 if data is None:
-                    self._logger.error("读取相机失败")
-                    break
+                    # 后台线程可能暂时还没拿到帧，短暂等待重试
+                    time.sleep(0.01)
+                    continue
 
                 ret, frame = data
                 if not ret or frame is None:
-                    self._logger.error("无法获取有效帧")
-                    break
+                    time.sleep(0.01)
+                    continue
 
                 if self._frame_count <= 3:
                     self._logger.info(f"[{self._frame_count}] 获取到相机帧: {frame.shape}")
@@ -169,7 +225,7 @@ class DarwinIntegratedApp:
                 # 前几帧打印编码状态
                 if encoded_frame is None and self._frame_count <= 10:
                     self._logger.info(f"[{self._frame_count}] 编码还未完成...")
-                elif encoded_frame is not None and self._frame_count <= 3:  # 前3帧只打印
+                elif encoded_frame is not None and self._frame_count <= 3:
                     self._logger.info(f"[{self._frame_count}] 编码完成！数据大小: {len(encoded_frame)} 字节")
 
                 # 3. 根据配置调用HTTP客户端
@@ -214,7 +270,6 @@ class DarwinIntegratedApp:
 
                 # 图像处理模式（可同时进行）
                 if self.config.display.show_processed and self.openmm_client:
-                    # /process/frame_yolo 接口需要原始 numpy 字节流，不是 JPEG 编码
                     self._logger.debug("发送图像处理请求...")
                     result = self.openmm_client.send_frame(
                         frame.tobytes(),
@@ -228,10 +283,7 @@ class DarwinIntegratedApp:
                     else:
                         self._logger.debug("处理结果为空")
 
-                # 4. 根据配置显示窗口（非阻塞，放入队列）
-                if self.config.display.show_original:
-                    self.display.show_original(frame)
-
+                # 4. 推送处理后的帧到显示（原始帧已由独立推送线程处理）
                 if self.config.display.show_processed:
                     if processed_frame is not None:
                         self.display.show_processed(processed_frame)
@@ -387,6 +439,11 @@ class DarwinIntegratedApp:
     def _cleanup(self):
         """清理资源"""
         self._logger.info("正在清理资源...")
+
+        # 停止视频显示推送线程
+        self._display_push_stop.set()
+        if self._display_push_thread:
+            self._display_push_thread.join(timeout=1)
         self.camera.release()
         self.display.destroy()
 

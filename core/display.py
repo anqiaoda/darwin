@@ -1,6 +1,7 @@
 """
-显示模块 - 多线程版本
-使用独立线程异步渲染窗口，避免阻塞主控制循环
+显示模块 - 高帧率版本
+使用双缓冲+独立显示线程，最大化视频窗口帧率
+显示线程以最快速度渲染最新帧，不等待主循环
 """
 import cv2
 import time
@@ -13,7 +14,7 @@ from utils.logger import get_logger
 
 
 class Display:
-    """视频显示器 - 多线程异步渲染"""
+    """视频显示器 - 高帧率双缓冲渲染"""
 
     def __init__(self, config: DisplayConfig):
         self.config = config
@@ -27,9 +28,16 @@ class Display:
         self._display_thread = None
         self._stop_event = threading.Event()
 
-        # 帧队列
-        self._original_queue = Queue(maxsize=2)  # 限制队列大小，避免堆积
-        self._processed_queue = Queue(maxsize=2)
+        # 双缓冲：写缓冲（主线程写）和读缓冲（显示线程读）
+        self._original_buffer_lock = threading.Lock()
+        self._original_write = None  # 主线程最新写入的帧
+        self._original_read = None   # 显示线程当前渲染的帧
+        self._original_new = threading.Event()  # 有新帧信号
+
+        self._processed_buffer_lock = threading.Lock()
+        self._processed_write = None
+        self._processed_read = None
+        self._processed_new = threading.Event()
 
         # 退出信号
         self._exit_key = None
@@ -41,11 +49,14 @@ class Display:
         """启动显示线程"""
         self._display_thread = threading.Thread(target=self._display_loop, daemon=True)
         self._display_thread.start()
-        self._logger.info("显示线程已启动")
+        self._logger.info("显示线程已启动（高帧率模式）")
 
     def _display_loop(self):
-        """显示线程主循环"""
+        """显示线程主循环 - 以最快速度渲染"""
         self._init_windows()
+
+        # 无新帧时的轮询间隔
+        poll_interval = 0.001  # 1ms
 
         while not self._stop_event.is_set():
             # 检查退出条件
@@ -73,25 +84,32 @@ class Display:
                 except:
                     pass
 
-            # 显示原始帧（每次循环都尝试显示）
+            # 交换双缓冲：将写缓冲的内容交换到读缓冲
+            has_update = False
+
             if self.config.show_original:
-                try:
-                    frame = self._original_queue.get_nowait()
-                    display_frame = self._prepare_frame(frame)
+                with self._original_buffer_lock:
+                    if self._original_write is not None:
+                        self._original_read = self._original_write
+                        self._original_write = None
+                        has_update = True
+
+                if self._original_read is not None:
+                    display_frame = self._prepare_frame(self._original_read)
                     if display_frame is not None:
                         cv2.imshow(self.config.window_name_original, display_frame)
-                except Empty:
-                    pass
 
-            # 显示处理帧
             if self.config.show_processed:
-                try:
-                    frame = self._processed_queue.get_nowait()
-                    display_frame = self._prepare_frame(frame)
+                with self._processed_buffer_lock:
+                    if self._processed_write is not None:
+                        self._processed_read = self._processed_write
+                        self._processed_write = None
+                        has_update = True
+
+                if self._processed_read is not None:
+                    display_frame = self._prepare_frame(self._processed_read)
                     if display_frame is not None:
                         cv2.imshow(self.config.window_name_processed, display_frame)
-                except Empty:
-                    pass
 
             # 检查按键
             key = cv2.waitKey(1) & 0xFF
@@ -102,8 +120,9 @@ class Display:
                 self._exit_key = ord('q')
                 break
 
-            # 短暂休眠，避免CPU占用过高
-            time.sleep(0.001)
+            # 如果没有更新，短暂休眠避免CPU空转
+            if not has_update:
+                time.sleep(poll_interval)
 
     def _init_windows(self):
         """初始化可缩放窗口"""
@@ -127,7 +146,7 @@ class Display:
             return None
 
         # 缩放显示
-        display_frame = frame.copy()
+        display_frame = frame
         if self.config.scale_factor != 1.0:
             h, w = frame.shape[:2]
             display_frame = cv2.resize(
@@ -145,6 +164,10 @@ class Display:
                 self._frame_count = 0
                 self._last_frame_time = current_time
 
+            # 只在需要缩放时才copy，否则直接在原帧上绘制（避免不必要的copy）
+            if display_frame is frame:
+                display_frame = frame.copy()
+
             cv2.putText(
                 display_frame,
                 f"FPS: {self._fps:.1f}",
@@ -159,7 +182,7 @@ class Display:
 
     def show_original(self, frame):
         """
-        显示原始帧（非阻塞，放入队列）
+        显示原始帧（非阻塞，双缓冲写入）
 
         Args:
             frame: 要显示的原始图像帧
@@ -167,19 +190,12 @@ class Display:
         if not self.config.show_original:
             return
 
-        try:
-            self._original_queue.put(frame, block=False)
-        except:
-            # 队列满了，丢弃旧帧
-            try:
-                self._original_queue.get_nowait()
-                self._original_queue.put(frame, block=False)
-            except:
-                pass
+        with self._original_buffer_lock:
+            self._original_write = frame
 
     def show_processed(self, frame):
         """
-        显示处理后的帧（非阻塞，放入队列）
+        显示处理后的帧（非阻塞，双缓冲写入）
 
         Args:
             frame: 要显示的处理后图像帧
@@ -187,15 +203,8 @@ class Display:
         if not self.config.show_processed:
             return
 
-        try:
-            self._processed_queue.put(frame, block=False)
-        except:
-            # 队列满了，丢弃旧帧
-            try:
-                self._processed_queue.get_nowait()
-                self._processed_queue.put(frame, block=False)
-            except:
-                pass
+        with self._processed_buffer_lock:
+            self._processed_write = frame
 
     def wait_key(self, delay: int = 1) -> int:
         """
