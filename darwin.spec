@@ -12,7 +12,6 @@ a = Analysis(
     ],
     datas=[
         ('config.json', '.'),
-        ('data', 'data'),
         ('./unitree_robots', 'unitree_robots'),
     ],
     hiddenimports=[
@@ -45,7 +44,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='darwin-v1.2',
+    name='darwin-v0.1.4',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

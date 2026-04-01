@@ -96,6 +96,53 @@ class HTTPClient:
 
         return None
 
+    def detect_person(self, frame_data: bytes, height: int = 480, width: int = 640, channels: int = 3) -> Optional[dict]:
+        """
+        检测图像中是否有人体
+
+        Args:
+            frame_data: 原始图像字节数据（numpy uint8 数组的字节流）
+            height: 图像高度
+            width: 图像宽度
+            channels: 图像通道数
+
+        Returns:
+            检测结果字典，包含 has_person、has_complete_person 等字段；失败返回 None
+        """
+        url = f"{self.config.base_url}{self.config.endpoint}"
+
+        for attempt in range(self.config.max_retries):
+            try:
+                # 构造数据：前12字节为尺寸信息，后面是图像数据
+                header = height.to_bytes(4, byteorder='little') + \
+                         width.to_bytes(4, byteorder='little') + \
+                         channels.to_bytes(4, byteorder='little')
+                payload = header + frame_data
+
+                response = self._session.post(
+                    url,
+                    data=payload,
+                    headers={"Content-Type": "application/octet-stream"},
+                    timeout=self.config.timeout
+                )
+
+                if response.status_code == 200:
+                    # 检测接口返回 JSON
+                    return response.json()
+                else:
+                    self._logger.warning(
+                        f"HTTP {response.status_code}: {response.text[:200]}"
+                    )
+
+            except requests.exceptions.Timeout:
+                self._logger.warning(f"请求超时 (尝试 {attempt + 1}/{self.config.max_retries})")
+            except requests.exceptions.RequestException as e:
+                self._logger.error(f"请求失败: {e}")
+            except Exception as e:
+                self._logger.error(f"解析响应失败: {e}")
+
+        return None
+
     def close(self):
         """关闭HTTP会话"""
         self._session.close()

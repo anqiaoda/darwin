@@ -68,6 +68,9 @@ class MuJoCoConfig:
     prepare_steps: int = 60                        # 准备阶段帧数
     gravity: list = field(default_factory=lambda: [0, 0, 0])  # 重力设置
     show_mujoco: bool = False                      # 显示MuJoCo机器人仿真窗口
+    require_human_detection: bool = False          # 是否需要检测到人体才调用仿真模型
+    human_detection_endpoint: str = "/detect/frame"  # 人体检测端点
+    human_detection_base_url: str = "http://172.18.20.118:9000"  # 人体检测服务地址
     http: HTTPConfig = field(default_factory=HTTPConfig)  # HTTP服务配置
 
 
@@ -181,6 +184,9 @@ def get_config(config_file: Optional[str] = None) -> Config:
         prepare_steps=mujoco_data.get("prepare_steps", 60),
         gravity=gravity,
         show_mujoco=mujoco_data.get("show_mujoco", False),
+        require_human_detection=mujoco_data.get("require_human_detection", False),
+        human_detection_endpoint=mujoco_data.get("human_detection_endpoint", "/detect/frame"),
+        human_detection_base_url=mujoco_data.get("human_detection_base_url", "http://172.18.20.118:9000"),
         http=mujoco_http
     )
 

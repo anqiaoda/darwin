@@ -47,53 +47,53 @@ class Display:
         """显示线程主循环"""
         self._init_windows()
 
-        last_original_time = 0
-        last_processed_time = 0
-
         while not self._stop_event.is_set():
             # 检查退出条件
             if self.config.show_original:
-                window_closed = (
-                    cv2.getWindowProperty(self.config.window_name_original, cv2.WND_PROP_VISIBLE) < 1
-                )
-                if window_closed:
-                    self._logger.info("原始窗口已关闭")
-                    self._exit_key = 27
-                    break
+                try:
+                    window_closed = (
+                        cv2.getWindowProperty(self.config.window_name_original, cv2.WND_PROP_VISIBLE) < 1
+                    )
+                    if window_closed:
+                        self._logger.info("原始窗口已关闭")
+                        self._exit_key = 27
+                        break
+                except:
+                    pass
 
             if self.config.show_processed:
-                window_closed = (
-                    cv2.getWindowProperty(self.config.window_name_processed, cv2.WND_PROP_VISIBLE) < 1
-                )
-                if window_closed:
-                    self._logger.info("处理窗口已关闭")
-                    self._exit_key = 27
-                    break
+                try:
+                    window_closed = (
+                        cv2.getWindowProperty(self.config.window_name_processed, cv2.WND_PROP_VISIBLE) < 1
+                    )
+                    if window_closed:
+                        self._logger.info("处理窗口已关闭")
+                        self._exit_key = 27
+                        break
+                except:
+                    pass
 
-            # 显示原始帧
-            current_time = time.time()
-            if self.config.show_original and (current_time - last_original_time) > 0.016:  # ~60fps
+            # 显示原始帧（每次循环都尝试显示）
+            if self.config.show_original:
                 try:
                     frame = self._original_queue.get_nowait()
                     display_frame = self._prepare_frame(frame)
                     if display_frame is not None:
                         cv2.imshow(self.config.window_name_original, display_frame)
-                    last_original_time = current_time
                 except Empty:
                     pass
 
             # 显示处理帧
-            if self.config.show_processed and (current_time - last_processed_time) > 0.016:  # ~60fps
+            if self.config.show_processed:
                 try:
                     frame = self._processed_queue.get_nowait()
                     display_frame = self._prepare_frame(frame)
                     if display_frame is not None:
                         cv2.imshow(self.config.window_name_processed, display_frame)
-                    last_processed_time = current_time
                 except Empty:
                     pass
 
-            # 检查按键（非阻塞）
+            # 检查按键
             key = cv2.waitKey(1) & 0xFF
             if key == 27:  # ESC
                 self._exit_key = 27

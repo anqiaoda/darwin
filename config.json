@@ -3,7 +3,7 @@
     "device_id": 1,
     "width": 640,
     "height": 480,
-    "fps": 120,
+    "fps": 60,
     "buffer_size": 1,
     "backend": "dshow"
   },
@@ -35,8 +35,11 @@
     "prepare_steps": 60,
     "gravity": [0, 0, 0],
     "show_mujoco": true,
+    "require_human_detection": true,
+    "human_detection_endpoint": "/detect/frame",
+    "human_detection_base_url": "http://172.18.20.118:9002",
     "http": {
-      "base_url": "http://172.18.26.235:8001",
+      "base_url": "http://172.18.20.194:8001",
       "endpoint": "/ws/infer",
       "timeout": 10,
       "use_websocket": true

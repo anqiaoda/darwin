@@ -12,15 +12,25 @@ from typing import Optional
 # 添加项目根目录到Python路径
 sys.path.insert(0, str(Path(__file__).parent))
 
-from config import get_config, Config
+from config import get_config, Config, HTTPConfig
 from core.camera_capture import CameraCapture
 from core.video_decoder import VideoDecoder
+from core.video_encoder import VideoEncoder  # 确保在 video_encoder.py 中声明了类
 from core.action_http_client import ActionHTTPClient
 from core.action_websocket_client import ActionWebSocketClient
 from core.http_client import HTTPClient
 from core.mujoco_simulator import MuJoCoRobotSimulator
 from core.display import Display
 from utils.logger import get_logger
+
+
+# 直接导入 VideoEncoder，避免延迟加载问题
+try:
+    from core.video_encoder import VideoEncoder as _VideoEncoderCheck
+    print(f"VideoEncoder 类导入成功: {_VideoEncoderCheck}")
+except ImportError as e:
+    print(f"VideoEncoder 类导入失败: {e}")
+    raise
 
 
 class DarwinIntegratedApp:
@@ -34,7 +44,10 @@ class DarwinIntegratedApp:
         # 初始化相机模块
         self.camera = CameraCapture(config.camera)
 
-        # 初始化视频编码器
+        # 初始化视频编码器（新增异步编码）
+        self.encoder = VideoEncoder(config.video, quality=75)
+
+        # 初始化视频解码器（用于解码处理后的图像）
         self.decoder = VideoDecoder(config.video)
 
         # 初始化显示模块
@@ -50,12 +63,21 @@ class DarwinIntegratedApp:
             if config.mujoco.http.use_websocket:
                 self._logger.info("使用WebSocket模式连接动作服务")
                 self.action_client = ActionWebSocketClient(config.mujoco.http)
+                # 等待WebSocket连接
+                for _ in range(50):
+                    time.sleep(0.1)
+                    if self.action_client.is_connected():
+                        self._logger.info("WebSocket客户端连接已建立")
+                        break
+                else:
+                    self._logger.error("WebSocket连接超时，请检查服务端是否运行")
             else:
                 self._logger.info("使用HTTP模式连接动作服务")
                 self.action_client = ActionHTTPClient(config.mujoco.http)
 
         if config.display.show_processed:
             self.openmm_client = HTTPClient(config.display.http)
+            self._logger.info(f"图像处理客户端已初始化: {config.display.http.base_url}{config.display.http.endpoint}")
 
         # 如果两个都没启用，则显示错误
         if not self.action_client and not self.openmm_client:
@@ -138,32 +160,62 @@ class DarwinIntegratedApp:
                     self._logger.error("无法获取有效帧")
                     break
 
-                # 2. 编码帧数据用于传输
-                encoded_frame = self.decoder.encode_frame(frame)
-                if encoded_frame is None:
-                    self._logger.error("帧编码失败")
-                    continue
+                if self._frame_count <= 3:
+                    self._logger.info(f"[{self._frame_count}] 获取到相机帧: {frame.shape}")
+
+                # 2. 异步编码帧数据用于传输
+                encoded_frame = self.encoder.encode_frame(frame)
+
+                # 前几帧打印编码状态
+                if encoded_frame is None and self._frame_count <= 10:
+                    self._logger.info(f"[{self._frame_count}] 编码还未完成...")
+                elif encoded_frame is not None and self._frame_count <= 3:  # 前3帧只打印
+                    self._logger.info(f"[{self._frame_count}] 编码完成！数据大小: {len(encoded_frame)} 字节")
 
                 # 3. 根据配置调用HTTP客户端
                 processed_frame = None
                 action_data = None
 
                 # 机器人控制模式（优先处理）
-                if self.config.mujoco.show_mujoco and self.action_client:
+                self._logger.debug(f"[{self._frame_count}] 检查条件: show_mujoco={self.config.mujoco.show_mujoco}, action_client={self.action_client is not None}, encoded_frame={encoded_frame is not None}")
+
+                # 判断是否需要人体检测
+                should_process_robot = True
+                if self.config.mujoco.require_human_detection:
+                    should_process_robot = self._check_human_detection(frame)
+
+                if self.config.mujoco.show_mujoco and self.action_client and encoded_frame and should_process_robot:
                     # 获取动作数据
+                    self._logger.info(f"[{self._frame_count}] 开始发送帧到WebSocket, 大小: {len(encoded_frame)} 字节")
                     action_data = self.action_client.send_frame(encoded_frame)
                     if action_data:
+                        self._logger.info(f"[{self._frame_count}] 收到动作数据: {list(action_data.keys())}")
                         # 新格式：motions.dof_pos (29个关节)
                         if 'motions' in action_data and 'dof_pos' in action_data['motions']:
                             dof_pos = action_data['motions']['dof_pos']
+                            self._logger.info(f"[{self._frame_count}] 应用 dof_pos: {len(dof_pos)} 个关节")
                             self._apply_robot_action(dof_pos)
                         # 兼容旧格式：q
                         elif 'q' in action_data:
+                            self._logger.info(f"[{self._frame_count}] 应用 q: {len(action_data['q'])} 个关节")
                             self._apply_robot_action(action_data['q'])
+                        else:
+                            self._logger.warning(f"[{self._frame_count}] 动作数据格式未知，keys: {list(action_data.keys())}")
+                    else:
+                        self._logger.warning(f"[{self._frame_count}] 未收到动作数据，可能服务端未响应")
+                else:
+                    if self._frame_count <= 5:
+                        if not self.config.mujoco.show_mujoco:
+                            self._logger.info(f"[{self._frame_count}] 控制被跳过: MuJoCo窗口未启用")
+                        elif not self.action_client:
+                            self._logger.info(f"[{self._frame_count}] 控制被跳过: action_client 未初始化")
+                        elif not encoded_frame:
+                            self._logger.info(f"[{self._frame_count}] 控制被跳过: encoded_frame 为空 (编码未完成)")
 
                 # 图像处理模式（可同时进行）
                 if self.config.display.show_processed and self.openmm_client:
                     # /process/frame_yolo 接口需要原始 numpy 字节流，不是 JPEG 编码
+                    self._logger.debug("发送图像处理请求...")
                     result = self.openmm_client.send_frame(
                         frame.tobytes(),
                         height=frame.shape[0],
@@ -171,6 +223,10 @@ class DarwinIntegratedApp:
                         channels=frame.shape[2] if len(frame.shape) == 3 else 1
                     )
                     processed_frame = self.decoder.decode_result(result)
+                    if processed_frame is not None:
+                        self._logger.debug("收到处理结果")
+                    else:
+                        self._logger.debug("处理结果为空")
 
                 # 4. 根据配置显示窗口（非阻塞，放入队列）
                 if self.config.display.show_original:
@@ -224,6 +280,59 @@ class DarwinIntegratedApp:
 
         self._current_positions = target_positions
         self._logger.info("准备阶段完成")
+
+    def _check_human_detection(self, frame):
+        """
+        检查图像中是否有人体
+
+        Args:
+            frame: 图像帧 (numpy array)
+
+        Returns:
+            bool: True表示检测到人体， False表示未检测到人体
+        """
+        try:
+            # 创建配置给HTTP客户端使用
+            http_config = HTTPConfig(
+                base_url=self.config.mujoco.human_detection_base_url,
+                endpoint=self.config.mujoco.human_detection_endpoint,
+                timeout=5.0,
+                max_retries=1
+            )
+
+            detection_client = HTTPClient(http_config)
+
+            # 构造数据：前12字节为尺寸信息，后面是图像数据
+            height, width = frame.shape[0], frame.shape[1]
+            channels = frame.shape[2] if len(frame.shape) == 3 else 1
+
+            payload = frame.tobytes()
+
+            # 调用人体检测API
+            result = detection_client.detect_person(payload, height, width, channels)
+
+            if result:
+                # 解析检测结果
+                has_person = result.get("has_person", False)
+                has_complete_person = result.get("has_complete_person", False)
+                person_count = result.get("person_count", 0)
+
+                if has_person and has_complete_person:
+                    self._logger.info(f"[{self._frame_count}] 检测到完整人体 (共{person_count}人)")
+                elif has_person:
+                    self._logger.info(f"[{self._frame_count}] 检测到人体但不完整")
+                else:
+                    self._logger.debug(f"[{self._frame_count}] 未检测到人体")
+
+                return has_person and has_complete_person
+            else:
+                self._logger.debug(f"[{self._frame_count}] 人体检测失败，认为无人")
+                return False
+
+        except Exception as e:
+            self._logger.error(f"[{self._frame_count}] 人体检测异常: {e}")
+            # 检测出错时，保守处理，认为不安全，跳过调用
+            return False
 
     def _apply_robot_action(self, joint_positions):
         """应用关节动作到机器人
@@ -280,6 +389,9 @@ class DarwinIntegratedApp:
         self._logger.info("正在清理资源...")
         self.camera.release()
         self.display.destroy()
+
+        if self.encoder:
+            self.encoder.close()
 
         if self.action_client:
             self.action_client.close()
