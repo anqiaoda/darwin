@@ -113,6 +113,12 @@ class DarwinIntegratedApp:
         self._display_push_thread = None
         self._display_push_stop = threading.Event()
 
+        # 人体检测状态机
+        self._detection_state = "IDLE"          # IDLE: 每帧检测 / RUNNING: 模型运行中，低频检测
+        self._consecutive_human_frames = 0      # IDLE下连续检测到完整人体的帧数
+        self._consecutive_lost_count = 0        # RUNNING下连续未检测到的次数
+        self._last_detection_time = 0           # 上次检测时间（RUNNING模式下限流用）
+
     def _init_mujoco(self) -> bool:
         """初始化MuJoCo仿真器"""
         try:
@@ -235,10 +241,10 @@ class DarwinIntegratedApp:
                 # 机器人控制模式（优先处理）
                 self._logger.debug(f"[{self._frame_count}] 检查条件: show_mujoco={self.config.mujoco.show_mujoco}, action_client={self.action_client is not None}, encoded_frame={encoded_frame is not None}")
 
-                # 判断是否需要人体检测
+                # 判断是否需要人体检测（状态机模式）
                 should_process_robot = True
                 if self.config.mujoco.require_human_detection:
-                    should_process_robot = self._check_human_detection(frame)
+                    should_process_robot = self._should_call_model(frame)
 
                 if self.config.mujoco.show_mujoco and self.action_client and encoded_frame and should_process_robot:
                     # 获取动作数据
@@ -332,6 +338,73 @@ class DarwinIntegratedApp:
 
         self._current_positions = target_positions
         self._logger.info("准备阶段完成")
+
+    def _should_call_model(self, frame) -> bool:
+        """人体检测状态机：决定是否应该调用模型
+
+        状态机逻辑：
+        - IDLE：每帧做人体检测，连续N帧检测到完整人体后进入RUNNING
+        - RUNNING：每秒做一次检测，连续M次未检测到则退回IDLE
+
+        Args:
+            frame: 当前图像帧
+
+        Returns:
+            True 表示应该调用模型，False 表示不调用
+        """
+        cfg = self.config.mujoco
+
+        if self._detection_state == "IDLE":
+            # 每帧都做检测
+            detected = self._check_human_detection(frame)
+            if detected:
+                self._consecutive_human_frames += 1
+                self._logger.info(
+                    f"[检测中] 连续检测到完整人体: {self._consecutive_human_frames}/{cfg.human_detection_confirm_frames}"
+                )
+                if self._consecutive_human_frames >= cfg.human_detection_confirm_frames:
+                    self._detection_state = "RUNNING"
+                    self._consecutive_human_frames = 0
+                    self._consecutive_lost_count = 0
+                    self._last_detection_time = time.time()
+                    self._logger.info("[状态切换] 检测中 → 模型运行中，开始调用模型")
+                    return True
+            else:
+                if self._consecutive_human_frames > 0:
+                    self._logger.info(
+                        f"[检测中] 连续计数中断，重置 ({self._consecutive_human_frames} → 0)"
+                    )
+                self._consecutive_human_frames = 0
+            return False
+
+        elif self._detection_state == "RUNNING":
+            # 检查是否到了检测间隔
+            now = time.time()
+            if now - self._last_detection_time >= cfg.human_detection_running_interval:
+                self._last_detection_time = now
+                detected = self._check_human_detection(frame)
+
+                if detected:
+                    if self._consecutive_lost_count > 0:
+                        self._logger.info(
+                            f"[模型运行中] 重新检测到人体，丢失计数重置 ({self._consecutive_lost_count} → 0)"
+                        )
+                    self._consecutive_lost_count = 0
+                else:
+                    self._consecutive_lost_count += 1
+                    self._logger.info(
+                        f"[模型运行中] 未检测到完整人体: {self._consecutive_lost_count}/{cfg.human_detection_lost_threshold}"
+                    )
+                    if self._consecutive_lost_count >= cfg.human_detection_lost_threshold:
+                        self._detection_state = "IDLE"
+                        self._consecutive_lost_count = 0
+                        self._consecutive_human_frames = 0
+                        self._logger.info("[状态切换] 模型运行中 → 检测中，停止调用模型")
+                        return False
+
+            return True
+
+        return False
 
     def _check_human_detection(self, frame):
         """

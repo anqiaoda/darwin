@@ -71,6 +71,9 @@ class MuJoCoConfig:
     require_human_detection: bool = False          # 是否需要检测到人体才调用仿真模型
     human_detection_endpoint: str = "/detect/frame"  # 人体检测端点
     human_detection_base_url: str = "http://172.18.20.118:9000"  # 人体检测服务地址
+    human_detection_confirm_frames: int = 5        # 连续检测到完整人体的帧数阈值，进入RUNNING
+    human_detection_lost_threshold: int = 3        # RUNNING下连续未检测到的次数阈值，退出RUNNING
+    human_detection_running_interval: float = 1.0  # RUNNING状态下检测间隔（秒）
     http: HTTPConfig = field(default_factory=HTTPConfig)  # HTTP服务配置
 
 
@@ -187,6 +190,9 @@ def get_config(config_file: Optional[str] = None) -> Config:
         require_human_detection=mujoco_data.get("require_human_detection", False),
         human_detection_endpoint=mujoco_data.get("human_detection_endpoint", "/detect/frame"),
         human_detection_base_url=mujoco_data.get("human_detection_base_url", "http://172.18.20.118:9000"),
+        human_detection_confirm_frames=mujoco_data.get("human_detection_confirm_frames", 5),
+        human_detection_lost_threshold=mujoco_data.get("human_detection_lost_threshold", 3),
+        human_detection_running_interval=mujoco_data.get("human_detection_running_interval", 1.0),
         http=mujoco_http
     )
 

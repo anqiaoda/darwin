@@ -18,7 +18,7 @@
     "show_fps": true,
     "scale_factor": 1.0,
     "show_original": true,
-    "show_processed": true,
+    "show_processed": false,
     "http": {
       "base_url": "http://172.18.20.118:9000",
       "endpoint": "/process/frame_yolo",
@@ -35,9 +35,12 @@
     "prepare_steps": 60,
     "gravity": [0, 0, 0],
     "show_mujoco": true,
-    "require_human_detection": false,
+    "require_human_detection": true,
     "human_detection_endpoint": "/detect/frame",
     "human_detection_base_url": "http://172.18.20.118:9002",
+    "human_detection_confirm_frames": 5,
+    "human_detection_lost_threshold": 3,
+    "human_detection_running_interval": 1.0,
     "http": {
       "base_url": "http://172.18.20.194:8001",
       "endpoint": "/ws/infer",
