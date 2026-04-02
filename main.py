@@ -251,12 +251,19 @@ class DarwinIntegratedApp:
                     self._logger.info(f"[{self._frame_count}] 开始发送帧到WebSocket, 大小: {len(encoded_frame)} 字节")
                     action_data = self.action_client.send_frame(encoded_frame)
                     if action_data:
-                        self._logger.info(f"[{self._frame_count}] 收到动作数据: {list(action_data.keys())}")
+                        self._logger.info(f"[{self._frame_count}] 收到动作数据: {action_data}")
                         # 新格式：motions.dof_pos (29个关节)
                         if 'motions' in action_data and 'dof_pos' in action_data['motions']:
-                            dof_pos = action_data['motions']['dof_pos']
-                            self._logger.info(f"[{self._frame_count}] 应用 dof_pos: {len(dof_pos)} 个关节")
-                            self._apply_robot_action(dof_pos)
+                            motions = action_data['motions']
+                            dof_pos = motions['dof_pos']
+                            # 提取根节点数据（优先从 motions 内部取，其次从顶层取）
+                            root_pos = motions.get('root_pos', action_data.get('root_pos', None))
+                            root_rot = motions.get('root_rot', action_data.get('root_rot', None))
+                            # 四元数转换：[x,y,z,w] → [w,x,y,z]
+                            if root_rot is not None:
+                                root_rot = np.array(root_rot)[[3, 0, 1, 2]]
+                            self._logger.info(f"[{self._frame_count}] 应用 dof_pos: {len(dof_pos)} 个关节, root_pos: {root_pos is not None}, root_rot: {root_rot is not None}")
+                            self._apply_robot_action(dof_pos, root_pos, root_rot)
                         # 兼容旧格式：q
                         elif 'q' in action_data:
                             self._logger.info(f"[{self._frame_count}] 应用 q: {len(action_data['q'])} 个关节")
@@ -459,11 +466,13 @@ class DarwinIntegratedApp:
             # 检测出错时，保守处理，认为不安全，跳过调用
             return False
 
-    def _apply_robot_action(self, joint_positions):
-        """应用关节动作到机器人
+    def _apply_robot_action(self, joint_positions, root_pos=None, root_rot=None):
+        """应用关节动作到机器人（通过插值）
 
         Args:
             joint_positions: 关节位置数组
+            root_pos: 根节点目标位置 [x, y, z]（可选）
+            root_rot: 根节点目标旋转 [w, x, y, z] scalar_first 格式（可选）
         """
         if not self.simulator:
             return
@@ -475,8 +484,8 @@ class DarwinIntegratedApp:
 
         frame_data = joint_positions[:n]
 
-        # 直接设置关节位置（运动学模式）
-        self.simulator.set_joint_positions(frame_data)
+        # 通过插值设置目标位置（仿真线程自动平滑过渡）
+        self.simulator.set_target_positions(frame_data, root_pos, root_rot)
         self._current_positions = frame_data
         self._action_count += 1
 

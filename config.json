@@ -35,14 +35,16 @@
     "prepare_steps": 60,
     "gravity": [0, 0, 0],
     "show_mujoco": true,
-    "require_human_detection": true,
+    "require_human_detection": false,
     "human_detection_endpoint": "/detect/frame",
     "human_detection_base_url": "http://172.18.20.118:9002",
     "human_detection_confirm_frames": 5,
     "human_detection_lost_threshold": 3,
     "human_detection_running_interval": 1.0,
+    "max_interp_time": 0.01,
+    "enable_interpolation": true,
     "http": {
-      "base_url": "http://172.18.20.194:8001",
+      "base_url": "http://172.18.26.209:8001",
       "endpoint": "/ws/infer",
       "timeout": 10,
       "use_websocket": true
