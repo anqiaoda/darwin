@@ -44,7 +44,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='darwin-v0.1.5',
+    name='darwin-v0.1.6',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

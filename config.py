@@ -25,8 +25,8 @@ class HTTPConfig:
     """HTTP服务配置"""
     base_url: str = "http://172.18.20.118:9000"  # 模型服务基础URL
     endpoint: str = "/process/image"              # API端点
-    timeout: int = 10                             # 请求超时时间(秒)
-    max_retries: int = 3                          # 最大重试次数
+    timeout: int = 2                              # 请求超时时间(秒)
+    max_retries: int = 1                          # 最大重试次数
     use_websocket: bool = False                   # 是否使用WebSocket
     websocket_endpoint: str = "/ws/infer"         # WebSocket端点（可选）
 
@@ -140,8 +140,8 @@ def get_http_config(http_data: dict) -> HTTPConfig:
     return HTTPConfig(
         base_url=http_data.get("base_url", "http://172.18.20.118:9000"),
         endpoint=http_data.get("endpoint", "/process/image"),
-        timeout=http_data.get("timeout", 10),
-        max_retries=http_data.get("max_retries", 3),
+        timeout=http_data.get("timeout", 2),
+        max_retries=http_data.get("max_retries", 1),
         use_websocket=http_data.get("use_websocket", False),
         websocket_endpoint=http_data.get("websocket_endpoint", "/ws/infer")
     )

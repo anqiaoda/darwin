@@ -140,6 +140,9 @@ class MuJoCoRobotSimulator:
         self._delta_time = 0.001  # 插值推进步长（秒）
         self._former_time = None  # 上次收到目标数据的时间
 
+        # 预分配插值用缓冲区（避免每次调用创建临时数组）
+        self._padded = np.zeros(self.num_joints, dtype=np.float64)
+
         # 根节点插值状态（由 _interp_lock 保护）
         self._former_root_pos: Optional[np.ndarray] = None
         self._target_root_pos: Optional[np.ndarray] = None
@@ -205,18 +208,17 @@ class MuJoCoRobotSimulator:
             n = min(len(target_positions), self.log_dimension, self.num_joints)
             self._target_positions = np.array(target_positions[:n], dtype=np.float64)
 
-            # 补齐到 num_joints（用 former 对应位置的值）
+            # 补齐到 num_joints（用 former 对应位置的值，复用预分配缓冲区）
             if len(self._target_positions) < self.num_joints and self._former_positions is not None:
-                padded = np.zeros(self.num_joints, dtype=np.float64)
-                padded[:len(self._target_positions)] = self._target_positions
-                padded[len(self._target_positions):] = self._former_positions[len(self._target_positions):]
-                self._target_positions = padded
+                self._padded[:len(self._target_positions)] = self._target_positions
+                self._padded[len(self._target_positions):] = self._former_positions[len(self._target_positions):]
+                self._target_positions = self._padded.copy()
 
             # 同样补齐 former
             if self._former_positions is not None and len(self._former_positions) < self.num_joints:
-                padded = np.zeros(self.num_joints, dtype=np.float64)
-                padded[:len(self._former_positions)] = self._former_positions
-                self._former_positions = padded
+                self._padded[:len(self._former_positions)] = self._former_positions
+                self._padded[len(self._former_positions):] = 0
+                self._former_positions = self._padded.copy()
 
             # 根节点目标
             if root_pos is not None and root_rot is not None:
@@ -256,11 +258,14 @@ class MuJoCoRobotSimulator:
         n = min(self.log_dimension, self.num_joints)
         return self.mj_data.qpos[7:7+n].copy()
 
-    def _step_interpolation(self):
+    def _step_interpolation(self, need_render=False):
         """在仿真步中推进插值（在仿真线程中调用，已持有 _lock）
 
-        每次仿真步调用，推进插值进度并应用插值后的位置到机器人。
-        同时插值根节点（LERP 位置 + SLERP 旋转）和关节角度。
+        每次仿真步调用，推进插值进度并更新 qpos。
+        只在 need_render=True 时调用 mj_forward，减少不必要的计算。
+
+        Args:
+            need_render: 是否即将渲染，为 True 时才调用 mj_forward
         """
         with self._interp_lock:
             if not self._is_interpolating or self._former_positions is None or self._target_positions is None:
@@ -279,11 +284,23 @@ class MuJoCoRobotSimulator:
                 # 插值根节点旋转（SLERP）
                 interp_root_rot = slerp(self._former_root_rot, self._target_root_rot, t)
 
-                # 应用完整状态
-                self._apply_full_state(interp_root_pos, interp_root_rot, interp_positions)
+                # 写入 qpos（不调用 mj_forward）
+                self.mj_data.qpos[:3] = interp_root_pos
+                self.mj_data.qpos[3:7] = interp_root_rot
+                n = min(len(interp_positions), self.num_joints)
+                self.mj_data.qpos[7:7+n] = interp_positions[:n]
+                self.mj_data.qvel[:] = 0
+
+                if need_render:
+                    _mujoco.mj_forward(self.mj_model, self.mj_data)
             else:
-                # 仅应用关节位置
-                self._apply_positions(interp_positions)
+                # 写入 qpos（不调用 mj_forward）
+                n = min(len(interp_positions), self.num_joints)
+                self.mj_data.qpos[7:7+n] = interp_positions[:n]
+                self.mj_data.qvel[:] = 0
+
+                if need_render:
+                    _mujoco.mj_forward(self.mj_model, self.mj_data)
 
             # 推进插值时间
             self._current_interp_time += self._delta_time
@@ -354,16 +371,16 @@ class MuJoCoRobotSimulator:
             positions[:] = self.mj_data.qpos[7:7+n]
         return positions
 
-    def step_simulation(self):
+    def step_simulation(self, need_render=False):
         """执行一次仿真步（纯运动学模式）
 
-        只在插值进行中时推进插值并调用 mj_forward，
-        无插值时不调用，让用户可以通过鼠标拖动机器人。
+        只在插值进行中时推进插值并更新 qpos，
+        need_render=True 时才调用 mj_forward 以减少计算开销。
         不调用 mj_step，避免物理仿真干扰运动学控制。
         """
         with self._lock:
             if self._is_interpolating:
-                self._step_interpolation()
+                self._step_interpolation(need_render)
 
     def is_running(self):
         """检查查看器是否仍在运行"""
@@ -384,14 +401,39 @@ class MuJoCoRobotSimulator:
     def _simulation_loop(self):
         """仿真+渲染循环（在后台线程中运行）
 
-        参考 robot_motion_viewer.py：每个循环做插值+forward+sync。
-        使用 delta_time 步长，无插值时只做 sync 保持窗口交互。
+        插值以 delta_time 步长推进，保证动作流畅。
+        渲染按 60 FPS 上限刷新，降低 GPU 负载。
         """
         self._logger.info("仿真+渲染线程启动")
+        last_render_time = 0.0
+        render_interval = 1.0 / 60.0  # 60 FPS 渲染上限
+
+        # FPS 统计
+        fps_frame_count = 0
+        fps_last_time = time.time()
+
         while not self._stop_event.is_set() and self.is_running():
-            self.step_simulation()
-            with self._lock:
-                self.viewer.sync()
+            # 判断是否即将渲染
+            now = time.time()
+            should_render = now - last_render_time >= render_interval
+
+            # 插值推进（只在即将渲染时调用 mj_forward）
+            self.step_simulation(need_render=should_render)
+
+            # 渲染按固定频率刷新
+            if should_render:
+                with self._lock:
+                    self.viewer.sync()
+                last_render_time = now
+
+                # FPS 统计（每秒打印一次）
+                fps_frame_count += 1
+                if now - fps_last_time >= 1.0:
+                    fps = fps_frame_count / (now - fps_last_time)
+                    self._logger.info(f"[MuJoCo] 渲染 FPS: {fps:.1f}")
+                    fps_frame_count = 0
+                    fps_last_time = now
+
             time.sleep(self._delta_time)
 
         self._logger.info("仿真+渲染线程结束")

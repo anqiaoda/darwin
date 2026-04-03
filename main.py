@@ -9,6 +9,7 @@ import threading
 import numpy as np
 from pathlib import Path
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # 添加项目根目录到Python路径
 sys.path.insert(0, str(Path(__file__).parent))
@@ -118,6 +119,17 @@ class DarwinIntegratedApp:
         self._consecutive_human_frames = 0      # IDLE下连续检测到完整人体的帧数
         self._consecutive_lost_count = 0        # RUNNING下连续未检测到的次数
         self._last_detection_time = 0           # 上次检测时间（RUNNING模式下限流用）
+
+        # 人体检测客户端（复用 TCP 连接）
+        self._detection_client = None
+        if config.mujoco.require_human_detection:
+            detection_config = HTTPConfig(
+                base_url=config.mujoco.human_detection_base_url,
+                endpoint=config.mujoco.human_detection_endpoint,
+                timeout=2.0,
+                max_retries=1
+            )
+            self._detection_client = HTTPClient(detection_config)
 
     def _init_mujoco(self) -> bool:
         """初始化MuJoCo仿真器"""
@@ -246,32 +258,66 @@ class DarwinIntegratedApp:
                 if self.config.mujoco.require_human_detection:
                     should_process_robot = self._should_call_model(frame)
 
+                # 准备并行任务
+                tasks = []
+
+                # 机器人控制任务
                 if self.config.mujoco.show_mujoco and self.action_client and encoded_frame and should_process_robot:
-                    # 获取动作数据
                     self._logger.info(f"[{self._frame_count}] 开始发送帧到WebSocket, 大小: {len(encoded_frame)} 字节")
-                    action_data = self.action_client.send_frame(encoded_frame)
-                    if action_data:
-                        self._logger.info(f"[{self._frame_count}] 收到动作数据: {action_data}")
-                        # 新格式：motions.dof_pos (29个关节)
-                        if 'motions' in action_data and 'dof_pos' in action_data['motions']:
-                            motions = action_data['motions']
-                            dof_pos = motions['dof_pos']
-                            # 提取根节点数据（优先从 motions 内部取，其次从顶层取）
-                            root_pos = motions.get('root_pos', action_data.get('root_pos', None))
-                            root_rot = motions.get('root_rot', action_data.get('root_rot', None))
-                            # 四元数转换：[x,y,z,w] → [w,x,y,z]
-                            if root_rot is not None:
-                                root_rot = np.array(root_rot)[[3, 0, 1, 2]]
-                            self._logger.info(f"[{self._frame_count}] 应用 dof_pos: {len(dof_pos)} 个关节, root_pos: {root_pos is not None}, root_rot: {root_rot is not None}")
-                            self._apply_robot_action(dof_pos, root_pos, root_rot)
-                        # 兼容旧格式：q
-                        elif 'q' in action_data:
-                            self._logger.info(f"[{self._frame_count}] 应用 q: {len(action_data['q'])} 个关节")
-                            self._apply_robot_action(action_data['q'])
-                        else:
-                            self._logger.warning(f"[{self._frame_count}] 动作数据格式未知，keys: {list(action_data.keys())}")
+                    tasks.append(('mujoco', self.action_client.send_frame, (encoded_frame,), {}))
+
+                # 图像处理任务
+                if self.config.display.show_processed and self.openmm_client:
+                    self._logger.debug("发送图像处理请求...")
+                    frame_bytes = frame.tobytes()
+                    tasks.append(('processed', self.openmm_client.send_frame,
+                                  (frame_bytes,),
+                                  {'height': frame.shape[0], 'width': frame.shape[1],
+                                   'channels': frame.shape[2] if len(frame.shape) == 3 else 1}))
+
+                # 并行执行所有任务
+                if tasks:
+                    with ThreadPoolExecutor(max_workers=min(len(tasks), 2)) as executor:
+                        futures = {executor.submit(func, *args, **kwargs): name
+                                   for name, func, args, kwargs in tasks}
+
+                        for future in as_completed(futures, timeout=2.0):
+                            name = futures[future]
+                            try:
+                                result = future.result()
+                                if result is not None:
+                                    if name == 'mujoco':
+                                        action_data = result
+                                        self._logger.info(f"[{self._frame_count}] 收到动作数据")
+                                    elif name == 'processed':
+                                        processed_frame = self.decoder.decode_result(result)
+                                        if processed_frame is not None:
+                                            self._logger.debug("收到处理结果")
+                                        else:
+                                            self._logger.debug("处理结果为空")
+                            except Exception as e:
+                                self._logger.warning(f"{name} 请求失败: {e}")
+
+                # 处理机器人动作数据
+                if action_data:
+                    # 新格式：motions.dof_pos (29个关节)
+                    if 'motions' in action_data and action_data['motions'] is not None and 'dof_pos' in action_data['motions']:
+                        motions = action_data['motions']
+                        dof_pos = motions['dof_pos']
+                        # 提取根节点数据（优先从 motions 内部取，其次从顶层取）
+                        root_pos = motions.get('root_pos', action_data.get('root_pos', None))
+                        root_rot = motions.get('root_rot', action_data.get('root_rot', None))
+                        # 四元数转换：[x,y,z,w] → [w,x,y,z]
+                        if root_rot is not None:
+                            root_rot = np.array(root_rot)[[3, 0, 1, 2]]
+                        self._logger.info(f"[{self._frame_count}] 应用 dof_pos: {len(dof_pos)} 个关节, root_pos: {root_pos is not None}, root_rot: {root_rot is not None}")
+                        self._apply_robot_action(dof_pos, root_pos, root_rot)
+                    # 兼容旧格式：q
+                    elif 'q' in action_data:
+                        self._logger.info(f"[{self._frame_count}] 应用 q: {len(action_data['q'])} 个关节")
+                        self._apply_robot_action(action_data['q'])
                     else:
-                        self._logger.warning(f"[{self._frame_count}] 未收到动作数据，可能服务端未响应")
+                        self._logger.warning(f"[{self._frame_count}] 动作数据格式未知，keys: {list(action_data.keys())}")
                 else:
                     if self._frame_count <= 5:
                         if not self.config.mujoco.show_mujoco:
@@ -280,21 +326,6 @@ class DarwinIntegratedApp:
                             self._logger.info(f"[{self._frame_count}] 控制被跳过: action_client 未初始化")
                         elif not encoded_frame:
                             self._logger.info(f"[{self._frame_count}] 控制被跳过: encoded_frame 为空 (编码未完成)")
-
-                # 图像处理模式（可同时进行）
-                if self.config.display.show_processed and self.openmm_client:
-                    self._logger.debug("发送图像处理请求...")
-                    result = self.openmm_client.send_frame(
-                        frame.tobytes(),
-                        height=frame.shape[0],
-                        width=frame.shape[1],
-                        channels=frame.shape[2] if len(frame.shape) == 3 else 1
-                    )
-                    processed_frame = self.decoder.decode_result(result)
-                    if processed_frame is not None:
-                        self._logger.debug("收到处理结果")
-                    else:
-                        self._logger.debug("处理结果为空")
 
                 # 4. 推送处理后的帧到显示（原始帧已由独立推送线程处理）
                 if self.config.display.show_processed:
@@ -415,7 +446,7 @@ class DarwinIntegratedApp:
 
     def _check_human_detection(self, frame):
         """
-        检查图像中是否有人体
+        检查图像中是否有人体（复用单例 HTTP 客户端）
 
         Args:
             frame: 图像帧 (numpy array)
@@ -423,25 +454,18 @@ class DarwinIntegratedApp:
         Returns:
             bool: True表示检测到人体， False表示未检测到人体
         """
+        if self._detection_client is None:
+            return False
+
         try:
-            # 创建配置给HTTP客户端使用
-            http_config = HTTPConfig(
-                base_url=self.config.mujoco.human_detection_base_url,
-                endpoint=self.config.mujoco.human_detection_endpoint,
-                timeout=5.0,
-                max_retries=1
-            )
-
-            detection_client = HTTPClient(http_config)
-
             # 构造数据：前12字节为尺寸信息，后面是图像数据
             height, width = frame.shape[0], frame.shape[1]
             channels = frame.shape[2] if len(frame.shape) == 3 else 1
 
             payload = frame.tobytes()
 
-            # 调用人体检测API
-            result = detection_client.detect_person(payload, height, width, channels)
+            # 调用人体检测API（复用 TCP 连接）
+            result = self._detection_client.detect_person(payload, height, width, channels)
 
             if result:
                 # 解析检测结果
@@ -537,6 +561,9 @@ class DarwinIntegratedApp:
 
         if self.openmm_client:
             self.openmm_client.close()
+
+        if self._detection_client:
+            self._detection_client.close()
 
         if self.simulator:
             self.simulator.cleanup()

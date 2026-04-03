@@ -19,9 +19,6 @@ class Display:
     def __init__(self, config: DisplayConfig):
         self.config = config
         self._logger = get_logger(__name__)
-        self._last_frame_time = time.time()
-        self._frame_count = 0
-        self._fps = 0
         self._initialized = False
 
         # 显示线程
@@ -42,6 +39,14 @@ class Display:
         # 退出信号
         self._exit_key = None
 
+        # 各窗口独立的 FPS 计数器
+        self._original_fps_data = {'count': 0, 'fps': 0.0, 'last_time': time.time()}
+        self._processed_fps_data = {'count': 0, 'fps': 0.0, 'last_time': time.time()}
+
+        # 窗口关闭检测频率控制
+        self._last_window_check_time = 0.0
+        self._window_check_interval = 0.1  # 每 100ms 检测一次窗口关闭
+
         # 启动显示线程
         self._start_display_thread()
 
@@ -59,30 +64,33 @@ class Display:
         poll_interval = 0.001  # 1ms
 
         while not self._stop_event.is_set():
-            # 检查退出条件
-            if self.config.show_original:
-                try:
-                    window_closed = (
-                        cv2.getWindowProperty(self.config.window_name_original, cv2.WND_PROP_VISIBLE) < 1
-                    )
-                    if window_closed:
-                        self._logger.info("原始窗口已关闭")
-                        self._exit_key = 27
-                        break
-                except:
-                    pass
+            # 检查退出条件（降低检测频率，避免频繁调用 getWindowProperty）
+            now = time.time()
+            if now - self._last_window_check_time >= self._window_check_interval:
+                self._last_window_check_time = now
+                if self.config.show_original:
+                    try:
+                        window_closed = (
+                            cv2.getWindowProperty(self.config.window_name_original, cv2.WND_PROP_VISIBLE) < 1
+                        )
+                        if window_closed:
+                            self._logger.info("原始窗口已关闭")
+                            self._exit_key = 27
+                            break
+                    except:
+                        pass
 
-            if self.config.show_processed:
-                try:
-                    window_closed = (
-                        cv2.getWindowProperty(self.config.window_name_processed, cv2.WND_PROP_VISIBLE) < 1
-                    )
-                    if window_closed:
-                        self._logger.info("处理窗口已关闭")
-                        self._exit_key = 27
-                        break
-                except:
-                    pass
+                if self.config.show_processed:
+                    try:
+                        window_closed = (
+                            cv2.getWindowProperty(self.config.window_name_processed, cv2.WND_PROP_VISIBLE) < 1
+                        )
+                        if window_closed:
+                            self._logger.info("处理窗口已关闭")
+                            self._exit_key = 27
+                            break
+                    except:
+                        pass
 
             # 交换双缓冲：将写缓冲的内容交换到读缓冲
             has_update = False
@@ -95,7 +103,7 @@ class Display:
                         has_update = True
 
                 if self._original_read is not None:
-                    display_frame = self._prepare_frame(self._original_read)
+                    display_frame = self._prepare_frame(self._original_read, self._original_fps_data)
                     if display_frame is not None:
                         cv2.imshow(self.config.window_name_original, display_frame)
 
@@ -107,7 +115,7 @@ class Display:
                         has_update = True
 
                 if self._processed_read is not None:
-                    display_frame = self._prepare_frame(self._processed_read)
+                    display_frame = self._prepare_frame(self._processed_read, self._processed_fps_data)
                     if display_frame is not None:
                         cv2.imshow(self.config.window_name_processed, display_frame)
 
@@ -140,8 +148,13 @@ class Display:
         self._initialized = True
         self._logger.info("窗口已初始化，支持拖动和缩放")
 
-    def _prepare_frame(self, frame):
-        """准备显示帧（缩放 + FPS绘制）"""
+    def _prepare_frame(self, frame, fps_data):
+        """准备显示帧（缩放 + FPS绘制）
+
+        Args:
+            frame: 原始帧
+            fps_data: 该窗口独立的 FPS 计数器 {'count', 'fps', 'last_time'}
+        """
         if frame is None:
             return None
 
@@ -155,22 +168,22 @@ class Display:
                  int(h * self.config.scale_factor))
             )
 
-        # 绘制FPS
+        # 绘制FPS（使用窗口独立的计数器）
         if self.config.show_fps:
-            self._frame_count += 1
+            fps_data['count'] += 1
             current_time = time.time()
-            if current_time - self._last_frame_time >= 1.0:
-                self._fps = self._frame_count / (current_time - self._last_frame_time)
-                self._frame_count = 0
-                self._last_frame_time = current_time
+            if current_time - fps_data['last_time'] >= 1.0:
+                fps_data['fps'] = fps_data['count'] / (current_time - fps_data['last_time'])
+                fps_data['count'] = 0
+                fps_data['last_time'] = current_time
 
-            # 只在需要缩放时才copy，否则直接在原帧上绘制（避免不必要的copy）
+            # 只在需要绘制FPS时才copy，避免修改原帧
             if display_frame is frame:
                 display_frame = frame.copy()
 
             cv2.putText(
                 display_frame,
-                f"FPS: {self._fps:.1f}",
+                f"FPS: {fps_data['fps']:.1f}",
                 (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 1,

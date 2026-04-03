@@ -18,7 +18,7 @@
     "show_fps": true,
     "scale_factor": 1.0,
     "show_original": true,
-    "show_processed": false,
+    "show_processed": true,
     "http": {
       "base_url": "http://172.18.20.118:9000",
       "endpoint": "/process/frame_yolo",
@@ -42,7 +42,7 @@
     "human_detection_lost_threshold": 3,
     "human_detection_running_interval": 1.0,
     "max_interp_time": 0.01,
-    "enable_interpolation": true,
+    "enable_interpolation": false,
     "http": {
       "base_url": "http://172.18.26.209:8001",
       "endpoint": "/ws/infer",
