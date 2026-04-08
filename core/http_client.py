@@ -1,10 +1,13 @@
 """
 HTTP客户端模块
 通过HTTP调用外部模型服务
+支持流水线模式：后台线程发送请求+接收结果，主线程非阻塞获取最新结果
 """
 import json
 import time
+import threading
 from typing import Optional, Any
+from queue import Queue, Empty
 import requests
 
 from config import HTTPConfig
@@ -12,7 +15,7 @@ from utils.logger import get_logger
 
 
 class HTTPClient:
-    """HTTP客户端"""
+    """HTTP客户端（支持流水线模式）"""
 
     def __init__(self, config: HTTPConfig):
         self.config = config
@@ -20,7 +23,13 @@ class HTTPClient:
         self._logger = get_logger(__name__)
         self._rate_limited_until = 0
         self._consecutive_429 = 0
-        self._retry_delay_base = 1.0  # 基础重试延迟
+        self._retry_delay_base = 1.0
+
+        # 流水线模式
+        self._pipeline_started = False
+        self._pipeline_stop = threading.Event()
+        self._send_queue: Queue = Queue(maxsize=2)  # 待发送的帧
+        self._result_queue: Queue = Queue(maxsize=2)  # 处理结果
 
     def _is_rate_limited(self) -> bool:
         """检查是否处于限流状态"""
@@ -143,6 +152,73 @@ class HTTPClient:
 
         return None
 
+    # ========== 流水线模式 ==========
+
+    def start_pipeline(self):
+        """启动流水线后台线程（发送+接收）"""
+        if self._pipeline_started:
+            return
+        self._pipeline_started = True
+        self._logger.info("启动HTTP流水线线程")
+
+        def _pipeline_loop():
+            while not self._pipeline_stop.is_set():
+                try:
+                    # 取待发送的帧
+                    item = self._send_queue.get(timeout=0.5)
+                    frame_data, height, width, channels = item
+
+                    # 发送请求并获取结果
+                    result = self.send_frame(frame_data, height, width, channels)
+                    if result is not None:
+                        # 放入结果队列，满了丢弃最旧的
+                        try:
+                            self._result_queue.put(result, block=False)
+                        except:
+                            try:
+                                self._result_queue.get_nowait()
+                                self._result_queue.put(result, block=False)
+                            except:
+                                pass
+                except Empty:
+                    continue
+                except Exception as e:
+                    self._logger.debug(f"流水线异常: {e}")
+
+        t = threading.Thread(target=_pipeline_loop, daemon=True)
+        t.start()
+
+    def send_frame_async(self, frame_data: bytes, height: int = 480, width: int = 640, channels: int = 3) -> bool:
+        """流水线发送：放入发送队列，不等待响应
+
+        Returns:
+            True 成功放入队列，False 队列满
+        """
+        try:
+            # 队列满了丢弃最旧的
+            if self._send_queue.full():
+                try:
+                    self._send_queue.get_nowait()
+                except:
+                    pass
+            self._send_queue.put((frame_data, height, width, channels), block=False)
+            return True
+        except:
+            return False
+
+    def get_latest_result(self) -> Optional[bytes]:
+        """非阻塞获取最新的处理结果（清空旧结果，只保留最新）"""
+        latest = None
+        try:
+            while True:
+                latest = self._result_queue.get_nowait()
+        except Empty:
+            pass
+        return latest
+
+    # ========== 通用方法 ==========
+
     def close(self):
         """关闭HTTP会话"""
+        self._pipeline_stop.set()
         self._session.close()

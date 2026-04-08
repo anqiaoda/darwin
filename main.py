@@ -9,7 +9,7 @@ import threading
 import numpy as np
 from pathlib import Path
 from typing import Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
+
 
 # 添加项目根目录到Python路径
 sys.path.insert(0, str(Path(__file__).parent))
@@ -63,13 +63,15 @@ class DarwinIntegratedApp:
         if config.mujoco.show_mujoco:
             # 根据配置选择 HTTP 或 WebSocket
             if config.mujoco.http.use_websocket:
-                self._logger.info("使用WebSocket模式连接动作服务")
+                self._logger.info("使用WebSocket流水线模式连接动作服务")
                 self.action_client = ActionWebSocketClient(config.mujoco.http)
                 # 等待WebSocket连接
                 for _ in range(50):
                     time.sleep(0.1)
                     if self.action_client.is_connected():
                         self._logger.info("WebSocket客户端连接已建立")
+                        # 启动流水线接收线程
+                        self.action_client.start_pipeline()
                         break
                 else:
                     self._logger.error("WebSocket连接超时，请检查服务端是否运行")
@@ -79,6 +81,7 @@ class DarwinIntegratedApp:
 
         if config.display.show_processed:
             self.openmm_client = HTTPClient(config.display.http)
+            self.openmm_client.start_pipeline()
             self._logger.info(f"图像处理客户端已初始化: {config.display.http.base_url}{config.display.http.endpoint}")
 
         # 如果两个都没启用，则显示错误
@@ -246,57 +249,45 @@ class DarwinIntegratedApp:
                 elif encoded_frame is not None and self._frame_count <= 3:
                     self._logger.info(f"[{self._frame_count}] 编码完成！数据大小: {len(encoded_frame)} 字节")
 
-                # 3. 根据配置调用HTTP客户端
+                # 3. 发送帧到服务端（流水线模式：只发送，不等待响应）
                 processed_frame = None
-                action_data = None
-
-                # 机器人控制模式（优先处理）
-                self._logger.debug(f"[{self._frame_count}] 检查条件: show_mujoco={self.config.mujoco.show_mujoco}, action_client={self.action_client is not None}, encoded_frame={encoded_frame is not None}")
 
                 # 判断是否需要人体检测（状态机模式）
                 should_process_robot = True
                 if self.config.mujoco.require_human_detection:
                     should_process_robot = self._should_call_model(frame)
 
-                # 准备并行任务
-                tasks = []
-
-                # 机器人控制任务
+                # 机器人控制：流水线发送（不阻塞）
                 if self.config.mujoco.show_mujoco and self.action_client and encoded_frame and should_process_robot:
-                    self._logger.info(f"[{self._frame_count}] 开始发送帧到WebSocket, 大小: {len(encoded_frame)} 字节")
-                    tasks.append(('mujoco', self.action_client.send_frame, (encoded_frame,), {}))
+                    self._logger.info(f"[{self._frame_count}] 发送帧到WebSocket, 大小: {len(encoded_frame)} 字节")
+                    self.action_client.send_frame_async(encoded_frame)
 
-                # 图像处理任务
+                # 图像处理：流水线发送（不阻塞）
                 if self.config.display.show_processed and self.openmm_client:
-                    self._logger.debug("发送图像处理请求...")
                     frame_bytes = frame.tobytes()
-                    tasks.append(('processed', self.openmm_client.send_frame,
-                                  (frame_bytes,),
-                                  {'height': frame.shape[0], 'width': frame.shape[1],
-                                   'channels': frame.shape[2] if len(frame.shape) == 3 else 1}))
+                    self.openmm_client.send_frame_async(
+                        frame_bytes, frame.shape[0], frame.shape[1],
+                        frame.shape[2] if len(frame.shape) == 3 else 1
+                    )
 
-                # 并行执行所有任务
-                if tasks:
-                    with ThreadPoolExecutor(max_workers=min(len(tasks), 2)) as executor:
-                        futures = {executor.submit(func, *args, **kwargs): name
-                                   for name, func, args, kwargs in tasks}
+                # 4. 非阻塞获取最新结果
+                action_data = None
+                processed_frame = None
 
-                        for future in as_completed(futures, timeout=2.0):
-                            name = futures[future]
-                            try:
-                                result = future.result()
-                                if result is not None:
-                                    if name == 'mujoco':
-                                        action_data = result
-                                        self._logger.info(f"[{self._frame_count}] 收到动作数据")
-                                    elif name == 'processed':
-                                        processed_frame = self.decoder.decode_result(result)
-                                        if processed_frame is not None:
-                                            self._logger.debug("收到处理结果")
-                                        else:
-                                            self._logger.debug("处理结果为空")
-                            except Exception as e:
-                                self._logger.warning(f"{name} 请求失败: {e}")
+                # 获取最新的动作结果
+                if self.config.mujoco.show_mujoco and self.action_client:
+                    action_data = self.action_client.get_latest_result()
+
+                # 获取最新的图像处理结果
+                if self.config.display.show_processed and self.openmm_client:
+                    latest_raw = self.openmm_client.get_latest_result()
+                    if latest_raw is not None:
+                        processed_frame = self.decoder.decode_result(latest_raw)
+
+                # 4. 非阻塞获取最新的动作结果
+                action_data = None
+                if self.config.mujoco.show_mujoco and self.action_client:
+                    action_data = self.action_client.get_latest_result()
 
                 # 处理机器人动作数据
                 if action_data:

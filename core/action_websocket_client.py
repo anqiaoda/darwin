@@ -1,6 +1,6 @@
 """
-动作WebSocket客户端模块 - 同步版本
-通过WebSocket同步发送帧并等待响应（实时模式）
+动作WebSocket客户端模块 - 流水线模式
+发送和接收分离：发送不阻塞，后台线程持续接收结果
 """
 import asyncio
 import websockets
@@ -8,13 +8,14 @@ import time
 import json
 from typing import Optional
 from threading import Thread, Event
+from queue import Queue, Empty
 
 from config import HTTPConfig
 from utils.logger import get_logger
 
 
 class ActionWebSocketClient:
-    """动作WebSocket客户端 - 同步等待响应"""
+    """动作WebSocket客户端 - 流水线模式（发送/接收分离）"""
 
     def __init__(self, config: HTTPConfig):
         self.config = config
@@ -28,7 +29,11 @@ class ActionWebSocketClient:
         self._loop = None
         self._thread = None
 
-        # 转换HTTP URL为WebSocket URL（参考 test_ws_client.py）
+        # 流水线模式
+        self._pipeline_started = False
+        self._result_queue: Queue = Queue(maxsize=2)
+
+        # 转换HTTP URL为WebSocket URL
         ws_url = config.base_url.replace("http://", "ws://").replace("https://", "wss://")
         self._ws_url = f"{ws_url}{config.endpoint}"
 
@@ -60,7 +65,7 @@ class ActionWebSocketClient:
                 async with websockets.connect(self._ws_url, max_size=None) as websocket:
                     self._websocket = websocket
                     self._connected = True
-                    retry_delay = 1.0  # 重置重试延迟
+                    retry_delay = 1.0
                     self._logger.info("WebSocket连接成功")
 
                     while not self._stop_event.is_set():
@@ -97,28 +102,105 @@ class ActionWebSocketClient:
         finally:
             self._connected = False
 
+    # ========== 流水线模式 ==========
+
+    def start_pipeline(self):
+        """启动流水线接收线程"""
+        if self._pipeline_started:
+            return
+        self._pipeline_started = True
+        self._logger.info("启动流水线接收线程")
+
+        def _recv_loop():
+            """后台持续接收 WebSocket 响应，放入结果队列"""
+            while not self._stop_event.is_set() and self._connected:
+                try:
+                    future = asyncio.run_coroutine_threadsafe(
+                        self._websocket.recv(),
+                        self._loop
+                    )
+                    resp = future.result(timeout=self.config.timeout)
+
+                    # 解析 JSON
+                    try:
+                        result = json.loads(resp)
+                        self._request_count += 1
+                        # 放入队列，满了则丢弃最旧的
+                        try:
+                            self._result_queue.put(result, block=False)
+                        except:
+                            try:
+                                self._result_queue.get_nowait()
+                                self._result_queue.put(result, block=False)
+                            except:
+                                pass
+                    except (json.JSONDecodeError, TypeError):
+                        self._logger.debug(f"无法解析JSON响应")
+                except asyncio.TimeoutError:
+                    continue
+                except Exception as e:
+                    self._logger.debug(f"接收异常: {e}")
+                    time.sleep(0.01)
+
+            self._logger.info("流水线接收线程结束")
+
+        t = Thread(target=_recv_loop, daemon=True)
+        t.start()
+
+    def send_frame_async(self, frame_bytes: bytes) -> bool:
+        """流水线发送：只发送不等待响应
+
+        Args:
+            frame_bytes: 帧字节数据（JPEG编码）
+
+        Returns:
+            True 发送成功，False 失败
+        """
+        if not self._connected or not self._websocket or not self._loop:
+            return False
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self._websocket.send(frame_bytes),
+                self._loop
+            )
+            future.result(timeout=self.config.timeout)
+            return True
+        except Exception as e:
+            self._logger.error(f"发送失败: {e}")
+            return False
+
+    def get_latest_result(self) -> Optional[dict]:
+        """非阻塞获取最新的动作结果（清空旧结果，只保留最新）
+
+        Returns:
+            最新的动作数据，无数据返回 None
+        """
+        latest = None
+        try:
+            while True:
+                latest = self._result_queue.get_nowait()
+        except Empty:
+            pass
+        return latest
+
+    # ========== 兼容旧模式 ==========
+
     async def _send_and_recv(self, frame_bytes: bytes) -> Optional[dict]:
-        """异步发送并接收响应"""
+        """异步发送并接收响应（旧同步模式）"""
         if not self._websocket:
             self._logger.error("WebSocket 未连接")
             return None
 
         try:
-            t0 = time.time()
             await self._websocket.send(frame_bytes)
-            self._logger.debug(f"发送成功，等待响应...")
-
             resp = await self._websocket.recv()
-            elapsed = time.time() - t0
-            self._logger.debug(f"收到响应，耗时: {elapsed:.3f}s")
-
             self._request_count += 1
 
-            # 解析响应
             try:
                 return json.loads(resp)
             except json.JSONDecodeError:
-                self._logger.warning(f"无法解析JSON: {resp[:100]}")
+                self._logger.warning(f"无法解析JSON: resp[:100]")
                 return None
 
         except Exception as e:
@@ -126,26 +208,15 @@ class ActionWebSocketClient:
             return None
 
     def send_frame(self, frame_bytes: bytes) -> Optional[dict]:
-        """
-        同步发送帧并等待响应（实时模式）
-        参考 test_ws_client.py: await ws.send(buf.tobytes()); resp = await ws.recv()
-
-        Args:
-            frame_bytes: 帧字节数据（JPEG编码）
-
-        Returns:
-            动作数据字典，失败返回None
-        """
+        """同步发送帧并等待响应（旧模式，向后兼容）"""
         if not self._connected or not self._websocket or not self._loop:
             return None
 
-        # 在事件循环中执行异步操作
         try:
             future = asyncio.run_coroutine_threadsafe(
                 self._send_and_recv(frame_bytes),
                 self._loop
             )
-            # 等待响应（带超时）
             result = future.result(timeout=self.config.timeout)
             return result
         except asyncio.TimeoutError:
